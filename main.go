@@ -1,19 +1,19 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/surodinsergey/golang-balance/db"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"strconv"
 )
 
 type Balance struct {
 	ID   int   `json:"id"`
 	Sum  int   `json:"sum"`
-	User *User `json:"user"`
+	User *User `json:"user_id"`
 }
 
 type User struct {
@@ -22,22 +22,30 @@ type User struct {
 	Lastname  string `json:"lastname"`
 }
 
-type RequestData struct {
-	Data string `json:"data"`
-}
-
-var balances []Balance
-
 func getBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
-	for _, item := range balances {
-		if strconv.Itoa(item.User.ID) == params["id"] {
-			json.NewEncoder(w).Encode(item)
-			return
-		}
+	DB := db.SetupDB()
+	defer DB.Close()
+	sqlStatement := `SELECT b.id, b.sum, u.id, u.lastname, u.firstname FROM balances as b LEFT JOIN users as u ON b.user_id=u.id WHERE user_id=$1;`
+	row := DB.QueryRow(sqlStatement, params["id"])
+	var balance Balance
+	var user User
+	err := row.Scan(&balance.ID, &balance.Sum, &user.ID, &user.Lastname, &user.Firstname)
+	balance.User = &user
+	switch err {
+	case sql.ErrNoRows:
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode("Нет баланса с id пользователя " + params["id"] + "!")
+		return
+	case nil:
+		json.NewEncoder(w).Encode(balance)
+		return
+	default:
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode("Произошла серверная ошибка , попробуйте еще раз или обратитесь к администратору!")
+		return
 	}
-	json.NewEncoder(w).Encode(&Balance{}) //TODO: Заменить на ошибку
 }
 
 func transferBalance(w http.ResponseWriter, r *http.Request) {
@@ -47,58 +55,137 @@ func transferBalance(w http.ResponseWriter, r *http.Request) {
 	)
 	reqBody, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		fmt.Fprintf(w, "Enter data!!")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode("Некоректные данные запроса!")
+		return
 	}
 	json.Unmarshal(reqBody, &request)
-	var (
-		from,
-		to int
-	)
-	for index, item := range balances {
-		if item.User.ID == request["data"]["from"] {
-			from = index
+
+	DB := db.SetupDB()
+	defer DB.Close()
+	sqlStatement := `SELECT b.id, b.sum FROM balances as b WHERE user_id=$1;`
+	row := DB.QueryRow(sqlStatement, request["data"]["from"])
+
+	var idFrom int
+	var sumFrom int
+	err = row.Scan(&idFrom, &sumFrom)
+
+	switch err {
+	case sql.ErrNoRows:
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode("Нет баланса списания у пользователя с id " + string(request["data"]["from"]) + "!")
+		return
+	case nil:
+		sqlStatement := `SELECT b.id, b.sum FROM balances as b WHERE user_id=$1;`
+		row := DB.QueryRow(sqlStatement, request["data"]["to"])
+		var idTo int
+		var sumTo int
+		err := row.Scan(&idTo, &sumTo)
+		switch err {
+		case sql.ErrNoRows:
+			w.WriteHeader(404)
+			json.NewEncoder(w).Encode("Нет баланса пополнения у пользователя с id " + string(request["data"]["to"]) + "!")
+			return
+		case nil:
+			money := request["data"]["sum"]
+			if checkBalance(sumFrom, money) {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode("На балансе списания у пользователя с id " + string(request["data"]["from"]) + " недостаточно средств!")
+				return
+			}
+			sumFrom -= money
+			sumTo += money
+			_, err := DB.Exec("update balances set sum = $1 where id = $2", sumFrom, idFrom)
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(err)
+				return
+			}
+			_, err = DB.Exec("update balances set sum = $1 where id = $2", sumTo, idTo)
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(err)
+				return
+			}
+		default:
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(err)
+			return
 		}
-		if item.User.ID == request["data"]["to"] {
-			to = index
-		}
+	default:
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(err)
+		return
 	}
 
-	balances[from].Sum -= request["data"]["sum"]
-	balances[to].Sum += request["data"]["sum"]
-
-	json.NewEncoder(w).Encode(balances)
+	json.NewEncoder(w).Encode("Перевод успешно осуществлен!")
 }
 
 func updateBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
 	var (
-		result  Balance
 		request map[string]map[string]int
+		balance Balance
+		user    User
 	)
-	for index, item := range balances {
-		if strconv.Itoa(item.User.ID) == params["id"] {
-			reqBody, err := ioutil.ReadAll(r.Body)
-			if err != nil {
-				fmt.Fprintf(w, "Enter data!!")
-			}
-			json.Unmarshal(reqBody, &request)
-			balances[index].Sum += request["data"]["sum"]
-			result = balances[index]
-			json.NewEncoder(w).Encode(result)
+
+	reqBody, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode("Некоректные данные запроса!")
+		return
+	}
+	json.Unmarshal(reqBody, &request)
+
+	DB := db.SetupDB()
+	defer DB.Close()
+	sqlStatement := `SELECT b.id, b.sum, u.id, u.lastname, u.firstname FROM balances as b LEFT JOIN users as u ON b.user_id=u.id WHERE user_id=$1;`
+	row := DB.QueryRow(sqlStatement, params["id"])
+	err = row.Scan(&balance.ID, &balance.Sum, &user.ID, &user.Lastname, &user.Firstname)
+	balance.User = &user
+
+	switch err {
+	case sql.ErrNoRows:
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode("Нет баланса с id пользователя " + params["id"] + "!")
+		return
+	case nil:
+		if checkBalance(balance.Sum, request["data"]["sum"]) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode("На балансе у пользователя с id " + string(params["id"]) + " недостаточно средств для списания!")
 			return
 		}
+		balance.Sum += request["data"]["sum"]
+		_, err = DB.Exec("update balances set sum = $1 where id = $2", balance.Sum, balance.ID)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(err)
+			return
+		}
+	default:
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(err)
+		return
 	}
-	json.NewEncoder(w).Encode(&Balance{}) //TODO: Заменить на ошибку
+
+	json.NewEncoder(w).Encode(balance)
+}
+
+func checkBalance(sum int, money int) bool {
+	return sum-money < 0 || sum+money < 0
+}
+
+func notFound(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(404)
+	json.NewEncoder(w).Encode("Несуществующий метод API!")
 }
 
 func main() {
 	r := mux.NewRouter()
-	//TODO: интегрировать БД , обработать ошибки
-	balances = append(balances, Balance{ID: 1, Sum: 100, User: &User{ID: 1, Firstname: "Василий", Lastname: "Пуговкин"}})
-	balances = append(balances, Balance{ID: 2, Sum: 500, User: &User{ID: 2, Firstname: "Андрей", Lastname: "Серебров"}})
 	r.HandleFunc("/balance/{id}", getBalance).Methods("GET")
 	r.HandleFunc("/balance/{id}", updateBalance).Methods("PUT")
 	r.HandleFunc("/balance/transfer", transferBalance).Methods("POST")
+	r.NotFoundHandler = http.HandlerFunc(notFound)
 	log.Fatal(http.ListenAndServe(":8010", r))
 }
