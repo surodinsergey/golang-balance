@@ -31,7 +31,7 @@ Body `application/json`:
 ```json
 {
   "data": {
-    "sum": -1330
+    "sum": -1330 // начисление положительное число , списание отрицательное
   }
 }
 ```
@@ -49,3 +49,5 @@ Body `application/json` :
   }
 }
 ```
+
+Коллекция для Postman : https://www.getpostman.com/collections/42e4d5efb1029ffe4c8b
