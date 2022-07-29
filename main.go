@@ -3,12 +3,23 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/surodinsergey/golang-balance/db"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
+	"time"
 )
+
+type Tranzaction struct {
+	ID    int       `json:"id"`
+	Sum   int       `json:"sum"`
+	Type  string    `json:"type"`
+	Date  time.Time `json:"date"`
+	*User `json:"user_id"`
+}
 
 type Balance struct {
 	ID   int   `json:"id"`
@@ -25,33 +36,72 @@ type User struct {
 func getBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
-	DB := db.SetupDB()
+	DB, errDb := db.SetupDB()
+	if errDb != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(fmt.Errorf("Ошибка соединения с БД : %q", errDb.Error()).Error())
+		return
+	}
 	defer DB.Close()
-	sqlStatement := `SELECT b.id, b.sum, u.id, u.lastname, u.firstname FROM balances as b LEFT JOIN users as u ON b.user_id=u.id WHERE user_id=$1;`
-	row := DB.QueryRow(sqlStatement, params["id"])
-	var balance Balance
 	var user User
-	err := row.Scan(&balance.ID, &balance.Sum, &user.ID, &user.Lastname, &user.Firstname)
-	balance.User = &user
+	balance := &Balance{}
+
+	sqlStatement := `SELECT u.id, u.lastname, u.firstname FROM users as u WHERE id=$1;`
+	row := DB.QueryRow(sqlStatement, params["id"])
+	err := row.Scan(&user.ID, &user.Lastname, &user.Firstname)
 	switch err {
 	case sql.ErrNoRows:
 		w.WriteHeader(404)
-		json.NewEncoder(w).Encode("Нет баланса с id пользователя " + params["id"] + "!")
+		json.NewEncoder(w).Encode("Нет пользователя c id " + params["id"] + "!")
 		return
 	case nil:
-		json.NewEncoder(w).Encode(balance)
-		return
+		balance.User = &user
+		sqlStatement := `SELECT t.id, t.sum, t.type, t.date FROM tranzactions as t WHERE t.user_id=` + params["id"] + `;`
+		rows, err := DB.Query(sqlStatement)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+			return
+		}
+
+		for rows.Next() {
+			var tranz Tranzaction
+
+			err = rows.Scan(&tranz.ID, &tranz.Sum, &tranz.Type, &tranz.Date)
+
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+				return
+			}
+			balance.Sum += tranz.Sum
+		}
+		balance.ID = user.ID
 	default:
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode("Произошла серверная ошибка , попробуйте еще раз или обратитесь к администратору!")
+		json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 		return
 	}
+
+	json.NewEncoder(w).Encode(balance)
+	return
 }
 
 func transferBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	type TransferUsersBalanceRequest struct {
+		Data struct {
+			From int
+			To   int
+			Sum  int
+		}
+	}
 	var (
-		request map[string]map[string]int
+		request     TransferUsersBalanceRequest
+		userFrom    User
+		userTo      User
+		balanceFrom Balance
+		balanceTo   Balance
 	)
 	reqBody, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -61,60 +111,93 @@ func transferBalance(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(reqBody, &request)
 
-	DB := db.SetupDB()
+	DB, errDb := db.SetupDB()
+	if errDb != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(errDb)
+		return
+	}
 	defer DB.Close()
-	sqlStatement := `SELECT b.id, b.sum FROM balances as b WHERE user_id=$1;`
-	row := DB.QueryRow(sqlStatement, request["data"]["from"])
 
-	var idFrom int
-	var sumFrom int
-	err = row.Scan(&idFrom, &sumFrom)
-
+	sqlStatement := `SELECT u.id, u.lastname, u.firstname FROM users as u WHERE id=$1;`
+	row := DB.QueryRow(sqlStatement, request.Data.From)
+	err = row.Scan(&userFrom.ID, &userFrom.Lastname, &userFrom.Firstname)
 	switch err {
 	case sql.ErrNoRows:
 		w.WriteHeader(404)
-		json.NewEncoder(w).Encode("Нет баланса списания у пользователя с id " + string(request["data"]["from"]) + "!")
+		json.NewEncoder(w).Encode("Нет пользователя c id " + strconv.Itoa(request.Data.From) + "!")
 		return
 	case nil:
-		sqlStatement := `SELECT b.id, b.sum FROM balances as b WHERE user_id=$1;`
-		row := DB.QueryRow(sqlStatement, request["data"]["to"])
-		var idTo int
-		var sumTo int
-		err := row.Scan(&idTo, &sumTo)
+		balanceFrom.User = &userFrom
+		sqlStatement := `SELECT u.id, u.lastname, u.firstname FROM users as u WHERE id=$1;`
+		row := DB.QueryRow(sqlStatement, request.Data.To)
+		err = row.Scan(&userTo.ID, &userTo.Lastname, &userTo.Firstname)
 		switch err {
 		case sql.ErrNoRows:
 			w.WriteHeader(404)
-			json.NewEncoder(w).Encode("Нет баланса пополнения у пользователя с id " + string(request["data"]["to"]) + "!")
+			json.NewEncoder(w).Encode("Нет пользователя c id " + strconv.Itoa(request.Data.To) + "!")
 			return
 		case nil:
-			money := request["data"]["sum"]
-			if checkBalance(sumFrom, money) {
+			balanceTo.User = &userTo
+			sqlStatement := `SELECT t.id, t.sum, t.type, t.date FROM tranzactions as t WHERE t.user_id=` + strconv.Itoa(request.Data.From) + `;`
+			rows, err := DB.Query(sqlStatement)
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+				return
+			}
+			for rows.Next() {
+				var tranz Tranzaction
+
+				err = rows.Scan(&tranz.ID, &tranz.Sum, &tranz.Type, &tranz.Date)
+
+				if err != nil {
+					w.WriteHeader(500)
+					json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+					return
+				}
+				balanceFrom.Sum += tranz.Sum
+			}
+			money := -request.Data.Sum
+			if checkBalance(balanceFrom.Sum, money) {
 				w.WriteHeader(400)
-				json.NewEncoder(w).Encode("На балансе списания у пользователя с id " + string(request["data"]["from"]) + " недостаточно средств!")
+				json.NewEncoder(w).Encode("На балансе списания у пользователя с id " + strconv.Itoa(request.Data.From) + " недостаточно средств!")
 				return
 			}
-			sumFrom -= money
-			sumTo += money
-			_, err := DB.Exec("update balances set sum = $1 where id = $2", sumFrom, idFrom)
+
+			var (
+				dateT        time.Time
+				lastInsertID int
+			)
+
+			dateT = time.Now()
+
+			err = DB.QueryRow("INSERT INTO tranzactions(sum, type, date, user_id) VALUES($1, $2, $3, $4) returning id;", -request.Data.Sum, "transfer", dateT, request.Data.From).Scan(&lastInsertID)
+
 			if err != nil {
 				w.WriteHeader(500)
-				json.NewEncoder(w).Encode(err)
+				json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 				return
 			}
-			_, err = DB.Exec("update balances set sum = $1 where id = $2", sumTo, idTo)
+			balanceFrom.ID = userFrom.ID
+
+			err = DB.QueryRow("INSERT INTO tranzactions(sum, type, date, user_id) VALUES($1, $2, $3, $4) returning id;", request.Data.Sum, "transfer", dateT, request.Data.To).Scan(&lastInsertID)
+
 			if err != nil {
 				w.WriteHeader(500)
-				json.NewEncoder(w).Encode(err)
+				json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 				return
 			}
+			balanceTo.ID = userTo.ID
+
 		default:
 			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(err)
+			json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 			return
 		}
 	default:
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(err)
+		json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 		return
 	}
 
@@ -124,8 +207,9 @@ func transferBalance(w http.ResponseWriter, r *http.Request) {
 func updateBalance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	params := mux.Vars(r)
+	type PutUserBalanceRequest struct{ Data struct{ Sum int } }
 	var (
-		request map[string]map[string]int
+		request PutUserBalanceRequest
 		balance Balance
 		user    User
 	)
@@ -138,34 +222,75 @@ func updateBalance(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(reqBody, &request)
 
-	DB := db.SetupDB()
+	DB, errDb := db.SetupDB()
+	if errDb != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(errDb)
+		return
+	}
 	defer DB.Close()
-	sqlStatement := `SELECT b.id, b.sum, u.id, u.lastname, u.firstname FROM balances as b LEFT JOIN users as u ON b.user_id=u.id WHERE user_id=$1;`
+	sqlStatement := `SELECT u.id, u.lastname, u.firstname FROM users as u WHERE id=$1;`
 	row := DB.QueryRow(sqlStatement, params["id"])
-	err = row.Scan(&balance.ID, &balance.Sum, &user.ID, &user.Lastname, &user.Firstname)
+	err = row.Scan(&user.ID, &user.Lastname, &user.Firstname)
 	balance.User = &user
 
 	switch err {
 	case sql.ErrNoRows:
 		w.WriteHeader(404)
-		json.NewEncoder(w).Encode("Нет баланса с id пользователя " + params["id"] + "!")
+		json.NewEncoder(w).Encode("Нет пользователя c id " + params["id"] + "!")
 		return
 	case nil:
-		if checkBalance(balance.Sum, request["data"]["sum"]) {
+		sqlStatement := `SELECT t.id, t.sum, t.type, t.date FROM tranzactions as t LEFT JOIN users as u ON t.user_id=u.id WHERE t.user_id=` + params["id"] + `;`
+		rows, err := DB.Query(sqlStatement)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+			return
+		}
+
+		for rows.Next() {
+			var tranz Tranzaction
+			err = rows.Scan(&tranz.ID, &tranz.Sum, &tranz.Type, &tranz.Date)
+
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(fmt.Errorf("Ошибка сервера : %q", err.Error()).Error())
+				return
+			}
+			balance.Sum += tranz.Sum
+		}
+		if checkBalance(balance.Sum, request.Data.Sum) {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode("На балансе у пользователя с id " + string(params["id"]) + " недостаточно средств для списания!")
 			return
 		}
-		balance.Sum += request["data"]["sum"]
-		_, err = DB.Exec("update balances set sum = $1 where id = $2", balance.Sum, balance.ID)
+		balance.Sum += request.Data.Sum
+
+		var (
+			typeT        string
+			dateT        time.Time
+			lastInsertID int
+		)
+
+		if request.Data.Sum < 0 {
+			typeT = "buy"
+		} else {
+			typeT = "pay"
+		}
+
+		dateT = time.Now()
+
+		err = DB.QueryRow("INSERT INTO tranzactions(sum, type, date, user_id) VALUES($1, $2, $3, $4) returning id;", request.Data.Sum, typeT, dateT, params["id"]).Scan(&lastInsertID)
+
 		if err != nil {
 			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(err)
+			json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 			return
 		}
+		balance.ID = user.ID
 	default:
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(err)
+		json.NewEncoder(w).Encode(fmt.Errorf("Произошла серверная ошибка : : %q", err.Error()).Error())
 		return
 	}
 
@@ -173,7 +298,7 @@ func updateBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 func checkBalance(sum int, money int) bool {
-	return sum-money < 0 || sum+money < 0
+	return sum+money < 0
 }
 
 func notFound(w http.ResponseWriter, r *http.Request) {

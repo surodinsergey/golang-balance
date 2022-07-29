@@ -7,7 +7,14 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS balances (
                                         id SERIAL PRIMARY KEY,
                                         sum varchar(80) NOT NULL,
-    user_id INTEGER REFERENCES users (Id)
+    user_id INTEGER REFERENCES users (id)
+    );
+CREATE TABLE IF NOT EXISTS tranzactions (
+    id SERIAL PRIMARY KEY,
+    sum varchar(80) NOT NULL,
+    type varchar(80) NOT NULL,
+    date timestamp NOT NULL,
+    user_id INTEGER REFERENCES users (id)
     );
 
 INSERT INTO users (

@@ -14,16 +14,16 @@ const (
 	DbPort     = 5432
 )
 
-func checkErr(err error) {
-	if err != nil {
-		panic(err)
-	}
+func checkErr(err error) bool {
+	return err != nil
 }
 
 // SetupDB DB set up
-func SetupDB() *sql.DB {
+func SetupDB() (*sql.DB, error) {
 	dbinfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", DbHost, DbPort, DbUser, DbPassword, DbName)
 	db, err := sql.Open("postgres", dbinfo)
-	checkErr(err)
-	return db
+	if checkErr(err) {
+		return nil, err
+	}
+	return db, nil
 }
